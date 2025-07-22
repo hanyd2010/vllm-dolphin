@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import collections.abc
-import math
 from typing import Optional, Tuple
 
 import torch
@@ -257,6 +256,8 @@ class DonutSwinSelfAttention(nn.Module):
         self.window_size = (
             window_size if isinstance(window_size, collections.abc.Iterable) else (window_size, window_size)
         )
+        self.scale = self.attention_head_size ** -0.5
+        self.fused_attn = True
 
         self.relative_position_bias_table = nn.Parameter(
             torch.zeros((2 * self.window_size[0] - 1) * (2 * self.window_size[1] - 1), num_heads)
@@ -287,6 +288,15 @@ class DonutSwinSelfAttention(nn.Module):
         x = x.view(new_x_shape)
         return x.permute(0, 2, 1, 3)
 
+    def _get_rel_pos_bias(self) -> torch.Tensor:
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)]
+        relative_position_bias = relative_position_bias.view(
+            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1
+        )
+
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        return relative_position_bias.unsqueeze(0)
+
     def forward(
             self,
             hidden_states: torch.Tensor,
@@ -301,40 +311,52 @@ class DonutSwinSelfAttention(nn.Module):
         value_layer = self.transpose_for_scores(self.value(hidden_states))
         query_layer = self.transpose_for_scores(mixed_query_layer)
 
-        # Take the dot product between "query" and "key" to get the raw attention scores.
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        if self.fused_attn:
+            attention_scores = self._get_rel_pos_bias()
+            if attention_mask is not None:
+                # Apply the attention mask is (precomputed for all layers in DonutSwinModel forward() function)
+                mask_shape = attention_mask.shape[0]
+                attention_mask = attention_mask.view(1, mask_shape, 1, dim, dim).expand(
+                    batch_size // mask_shape, mask_shape, self.num_attention_heads, dim, dim
+                )
+                attention_scores = attention_scores + attention_mask.unsqueeze(1).unsqueeze(0)
+                attention_scores = attention_scores.view(-1, self.num_attention_heads, dim, dim)
 
-        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
-
-        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)]
-        relative_position_bias = relative_position_bias.view(
-            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1
-        )
-
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
-        attention_scores = attention_scores + relative_position_bias.unsqueeze(0)
-
-        if attention_mask is not None:
-            # Apply the attention mask is (precomputed for all layers in DonutSwinModel forward() function)
-            mask_shape = attention_mask.shape[0]
-            attention_scores = attention_scores.view(
-                batch_size // mask_shape, mask_shape, self.num_attention_heads, dim, dim
+            context_layer = torch.nn.functional.scaled_dot_product_attention(
+                query_layer, key_layer, value_layer,
+                attn_mask=attention_scores,
+                dropout_p=0.,
             )
-            attention_scores = attention_scores + attention_mask.unsqueeze(1).unsqueeze(0)
-            attention_scores = attention_scores.view(-1, self.num_attention_heads, dim, dim)
+            attention_probs = None
+        else:
+            # Take the dot product between "query" and "key" to get the raw attention scores.
+            attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
 
-        # Normalize the attention scores to probabilities.
-        attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+            attention_scores = attention_scores * self.scale
+            attention_scores = attention_scores + self._get_rel_pos_bias()
 
-        # This is actually dropping out entire tokens to attend to, which might
-        # seem a bit unusual, but is taken from the original Transformer paper.
-        attention_probs = self.dropout(attention_probs)
+            if attention_mask is not None:
+                # Apply the attention mask is (precomputed for all layers in DonutSwinModel forward() function)
+                mask_shape = attention_mask.shape[0]
+                attention_scores = attention_scores.view(
+                    batch_size // mask_shape, mask_shape, self.num_attention_heads, dim, dim
+                )
+                attention_scores = attention_scores + attention_mask.unsqueeze(1).unsqueeze(0)
+                attention_scores = attention_scores.view(-1, self.num_attention_heads, dim, dim)
 
-        # Mask heads if we want to
-        if head_mask is not None:
-            attention_probs = attention_probs * head_mask
+            # Normalize the attention scores to probabilities.
+            attention_probs = nn.functional.softmax(attention_scores, dim=-1)
 
-        context_layer = torch.matmul(attention_probs, value_layer)
+            # This is actually dropping out entire tokens to attend to, which might
+            # seem a bit unusual, but is taken from the original Transformer paper.
+            attention_probs = self.dropout(attention_probs)
+
+            # Mask heads if we want to
+            if head_mask is not None:
+                attention_probs = attention_probs * head_mask
+
+            context_layer = torch.matmul(attention_probs, value_layer)
+
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(new_context_layer_shape)

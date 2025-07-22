@@ -4,9 +4,10 @@
 from setuptools import setup
 
 setup(name='vllm_dolphin',
-      version='0.1',
+      version='0.2',
       packages=['vllm_dolphin'],
       install_requires=[
+          "timm>=1.0.15",
           "vllm>=0.9.0",
           "vllm-mbart>=0.1"
       ],

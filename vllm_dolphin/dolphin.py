@@ -28,6 +28,30 @@ from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm_mbart.mbart import MBartDecoderWrapper
 
 from .donut_swin import DonutSwinModel
+from .swin_transformer import TimmSwinEncoder
+
+
+class DolphinVisionModel(nn.Module, SupportsV0Only):
+    main_input_name = "pixel_values"
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        self.config = config
+        self.timm_model = TimmSwinEncoder(
+            vllm_config=vllm_config,
+            prefix=f"{prefix}.timm_model"
+        )
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        r"""
+        Args:
+            pixel_values
+                torch.Tensor of *encoder* input pixel values.
+        Returns:
+            Output torch.Tensor
+        """
+        return self.timm_model(pixel_values)
 
 
 class DolphinLanguageForConditionalGeneration(nn.Module, SupportsV0Only):
@@ -239,7 +263,15 @@ class DolphinForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsV0O
         self.config = config
         self.vision_config = config.encoder
         self.processor_config = processor_config
-        self.encoder = DonutSwinModel.from_config(config=config.encoder)
+        if config.encoder.model_type == "donut-swin":
+            self.encoder = DonutSwinModel.from_config(config=config.encoder)
+        elif config.encoder.model_type == "dolphin_vision":
+            self.encoder = DolphinVisionModel(
+                vllm_config=vllm_config.with_hf_config(config.encoder),
+                prefix=f"{prefix}.encoder",
+            )
+        else:
+            raise ValueError(f"Unsupported encoder model type: {config.encoder.model_type}")
 
         self.decoder = DolphinLanguageForConditionalGeneration(
             vllm_config=vllm_config.with_hf_config(config.decoder),
